@@ -9,6 +9,10 @@
 // Calculates z = α * x + y
 __global__ void saxpy(size_t n, float a, float* x, float* y, float* z) {
     // TODO (Warm-up, Task 3): Implement!
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        z[idx] = a * x[idx] + y[idx];
+    };
 }
 
 float get_rand_float() {
@@ -97,13 +101,14 @@ int main(int argc, char* argv[]) {
     // TODO (Warm-up, Task 2): Set execution configuration parameters
     //      thr_per_blk: number of CUDA threads per grid block
     //      blk_in_grid: number of blocks in grid
-    int thr_per_blk;
-    int blk_in_grid;
+    int thr_per_blk = 1024;
+    int blk_in_grid = (N + thr_per_blk - 1) / thr_per_blk;
 
     printf("Running kernel...\n");
     cudaCheckError(cudaEventRecord(kernelStart));
 
     // TODO (Warm-up, Task 2): Launch kernel using specified parameters
+    saxpy<<<blk_in_grid, thr_per_blk>>>(N, alpha, d_x, d_y, d_z);
 
     cudaCheckError(cudaGetLastError());
     cudaCheckError(cudaEventRecord(kernelStop));

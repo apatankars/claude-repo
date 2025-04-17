@@ -12,7 +12,18 @@
 
 void sgemm_sequential(int M, int K, int N, float alpha, const float *A,
                       const float *B, float beta, float *C) {
-    // TODO (Part 1.0): Implement!
+    // A = MxK
+    // B = KxN
+    // C = MxN
+    for (int row = 0; row < M; ++row) {
+        for (int j = 0; j < N; ++j) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; ++k) {
+                sum += A[row * K + k] * B[k * N + j];
+            }
+            C[row * N + j] = alpha * sum + beta * C[row * N + j];
+        }
+    }
 }
 
 // -------------------------------------------------------------------------------------
@@ -21,6 +32,19 @@ void sgemm_sequential(int M, int K, int N, float alpha, const float *A,
 __global__ void sgemm_naive(int M, int K, int N, float alpha, const float *A,
                             const float *B, float beta, float *C) {
     // TODO (Part 1.1): Implement!
+    // A = MxK
+    // B = KxN
+    // C = MxN
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < M && col < N) {
+        float sum = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            sum += A[row * K + k] * B[k * N + col];
+        }
+        C[row * N + col] = alpha * sum + beta * C[row * N + col];
+    }
 }
 
 // -------------------------------------------------------------------------------------
@@ -29,6 +53,16 @@ __global__ void sgemm_naive(int M, int K, int N, float alpha, const float *A,
 __global__ void sgemm_global_coalescing(int M, int K, int N, float alpha, const float *A,
                                        const float *B, float beta, float *C) {
     // TODO (Part 1.2): Implement!
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < M && col < N) {
+        float sum = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            sum += A[row * K + k] * B[k * N + col];
+        }
+        C[row * N + col] = alpha * sum + beta * C[row * N + col];
+    }
 }
 
 // -------------------------------------------------------------------------------------
@@ -41,6 +75,31 @@ __global__ void sgemm_shared_mem_cache(int M, int K, int N, float alpha, const f
     __shared__ float blockB[BLOCKDIM * BLOCKDIM];
 
     // TODO (Part 1.3): Implement!
+    int row = blockIdx.y * BLOCKDIM + threadIdx.y;
+    int col = blockIdx.x * BLOCKDIM + threadIdx.x;
+    float sum = 0.0f;
+
+    for (int k = 0; k < (K + BLOCKDIM - 1) / BLOCKDIM; ++k) {
+        if (row < M && k * BLOCKDIM + threadIdx.x < K) {
+            blockA[threadIdx.y * BLOCKDIM + threadIdx.x] = A[row * K + k * BLOCKDIM + threadIdx.x];
+        } else {
+            blockA[threadIdx.y * BLOCKDIM + threadIdx.x] = 0.0f;
+        }
+        if (col < N && k * BLOCKDIM + threadIdx.y < K) {
+            blockB[threadIdx.y * BLOCKDIM + threadIdx.x] = B[(k * BLOCKDIM + threadIdx.y) * N + col];
+        } else {
+            blockB[threadIdx.y * BLOCKDIM + threadIdx.x] = 0.0f;
+        }
+        __syncthreads();
+
+        for (int j = 0; j < BLOCKDIM; ++j) {
+            sum += blockA[threadIdx.y * BLOCKDIM + j] * blockB[j * BLOCKDIM + threadIdx.x];
+        }
+        __syncthreads();
+    }
+    if (row < M && col < N) {
+        C[row * N + col] = alpha * sum + beta * C[row * N + col];
+    }
 }
 
 // -------------------------------------------------------------------------------------
@@ -76,22 +135,22 @@ inline void launch_kernel(long kernel_num, int M, int K, int N, float alpha,
                           const float *d_A, const float *d_B, float beta, float *d_C) {
     if(kernel_num == 1) {
         // TODO (Part 1.1): Set execution configuration parameters
-        dim3 thr_per_blk;
-        dim3 blk_in_grid;
+        dim3 thr_per_blk(32, 32);
+        dim3 blk_in_grid((M+31/32), (N+31/32));
         
         sgemm_naive<<<blk_in_grid, thr_per_blk>>>(M, K, N, alpha, d_A, d_B, beta, d_C);
     } else if(kernel_num == 2) {
         // TODO (Part 1.2): Set execution configuration parameters
-        dim3 thr_per_blk;
-        dim3 blk_in_grid;
+        dim3 thr_per_blk(32, 32);
+        dim3 blk_in_grid((N + 31) / 32, (M + 31) / 32);
 
         sgemm_global_coalescing<<<blk_in_grid, thr_per_blk>>>(M, K, N, alpha, d_A, d_B, beta, d_C);
     } else if(kernel_num == 3) {
         const uint BLOCKDIM = 32;
 
         // TODO (Part 1.3): Set execution configuration parameters
-        dim3 thr_per_blk;
-        dim3 blk_in_grid;
+        dim3 thr_per_blk(BLOCKDIM, BLOCKDIM);
+        dim3 blk_in_grid((N + BLOCKDIM - 1) / BLOCKDIM, (M + BLOCKDIM - 1) / BLOCKDIM);
 
         sgemm_shared_mem_cache<BLOCKDIM><<<blk_in_grid, thr_per_blk>>>(M, K, N, alpha, d_A, d_B, beta, d_C);
     } else if(kernel_num == 4) {
