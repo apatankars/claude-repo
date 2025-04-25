@@ -11,7 +11,8 @@ def saxpy_memory_accesses(N: int) -> int:
         int: the number of memory accesses the SAXPY kernel performs
     """
     # TODO (Warm-up, Task 4): Implement!
-    return 0
+    bytes_per_element = 4  
+    return 3 * N * bytes_per_element
 
 def saxpy_transferred(N: int) -> int:
     """
@@ -26,7 +27,7 @@ def saxpy_transferred(N: int) -> int:
         int: the number of memory accesses the SAXPY kernel performs
     """
     # TODO (Warm-up, Task 4): Implement!
-    return 0
+    return N * 4
 
 def saxpy_flops(N: int) -> int:
     """
@@ -39,7 +40,8 @@ def saxpy_flops(N: int) -> int:
         int: the number of FLOPs the SAXPY kernel performs
     """
     # TODO (Warm-up, Task 5): Implement!
-    return 0
+
+    return 2 * N
 
 def sgemm_memory_accesses(M: int, K: int, N: int) -> int:
     """
@@ -58,7 +60,7 @@ def sgemm_memory_accesses(M: int, K: int, N: int) -> int:
         int: the number of memory accesses the SGEMM kernel performs
     """
     # TODO (Part 1.0): Implement!
-    return 0
+    return 4 * ((M * K) + (K * N) + (2 * M * N))
 
 def sgemm_flops(M: int, K: int, N: int) -> int:
     """
@@ -74,4 +76,4 @@ def sgemm_flops(M: int, K: int, N: int) -> int:
         int: the number of memory accesses the SGEMM kernel performs
     """
     # TODO (Part 1.0): Implement!
-    return 0
+    return (M * N) * ((2 * K) + 3)
