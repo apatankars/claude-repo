@@ -1,302 +1,670 @@
+[![Review Assignment Due Date](https://classroom.github.com/assets/deadline-readme-button-22041afd0340ce965d47ae6ef1cefeee28c7c493a6346c4f15d667ab976d596c.svg)](https://classroom.github.com/a/T8a-qz2H)
 
-# Conceptual Questions
+# Assignment 2: Optimizing Transformers
 
-## Warm-up: SAXPY
+## Part 1.1: Implementing Attention
 
-1. Suppose that we are performing SAXPY on two vectors of length $N$, with $T$ threads per block and where a single thread performs SAXPY for one entry of the output vector. Derive an expression in terms of $N$ and $T$ for how many thread blocks are needed to perform SAXPY (note that $T$ doesn't necessarily divide $N$!).
+1. Provide a brief (1-3 sentence) explanation for the “causal mask” in self-attention. What is its purpose, and how is it calculated?
 
-   In order to calculate the number of thread blocks necessary to perform SAXPY given that $N$ is not directly divisible by $T$, we need to calculate the cieling division. This is because if there are any threads that aren't easily divided into one our blocks, we allocate them to a final block that may not be filled entirely. For example, if $N=100$ and $T=32$, $N$ is not easily divisible by $T$ and if round, we would only get 3 thread blocks, where $4$ threads are unaccounted for. Therefore, we use cieling division to always ensure we have more than enough thread blocks. The number of thread blocks, $B$ can be expressed as
-   $$ B = \frac{N+T-1}{T} $$ 
-   where we are assuming integer division. Now calculating this from the same example above, $N=100$ and $T=32$, $B=4$ which is the correct and expected output.
+The causal mask is used during training for models that use self-attention. This is because during training, the model has access to future tokens, but this is against the auto-regressive nature of the task. So, in order to properly make sure the model predicts the next token and doesn't just peek ahead, a casual mask is applied such that the attention scores for future tokens are "masked" so that they do not affect the final attention output for that token. This is calculated by using the attention score matirx and making the values in the upper right hand triangle (all future tokens) are very negative such that when they are added to the calculated attention scores, they still zero out.
 
-2. Recall that our kernel will perform SAXPY for a unique entry of the output vector. Determine an expression, in terms of `gridDim.x`, `blockIdx.x`, `blockDim.x`, and/or `threadIdx.x`, to obtain a unique index into the output vector that the kernel will perform SAXPY for.
+2. To build intuition for the number of attention layers required to solve this associative recall task, determine when the model starts solving the task with 90+% accuracy as a function of the number of attention layers. You can control the number of such layers as an argument to `run.sh` (e.g. `./run.sh num_layers=4`). What is the minimum number of layers at which the transformer starts solving with 90+% accuracy?
 
-   In order to calculate the index into our final output array, we need to properly calculate this based on the index of the block, the number of threads in each block, and then the index of the thread within the block. For example, consider an input array where $N=1000$. Therefore, our output array for SAXPY will also be $N=1000$. If we assume that $T=256$, then we calculate (using the formula above), we need $4$ thread blocks. However, each individual `threadIdx.x` will now only span from `[0, 256)`, therefore we need to incorporate the information about which block it is in so it properly scales to the output. We know which block we are in using `blockIdx.x` and know the number of threads in each block `blockDim.x`. Using the combination of these factors, we get that final index is
-    $$\texttt{outputIdx}=(\texttt{blockIdx.x} \cdot \texttt{blockDim.x})+\texttt{threadIdx.x}$$
+   We need two attention layers to run this associative recall task with 90+% accuracy. This makes intuitive sense because the first attention layer is required to learn the token embedding of the previous token was. This will help us keep track of what tokens have appeared before. However, to make sure that each key-value pair only pays attention to its key or value, we need a second layer that learns the token representation for the proceeding token. This forward-backwards relationship builds the representations, while the second layer uses these representations to perform the actual recall operation when queried.
 
-3. Research the theoretical memory bandwidths for each of the 3 above transfers for the GPU you are running on. Running the SAXPY kernel (e.g. `./saxpy -n 1024`) will display the name of your GPU model. You can also determine this from the Hydra ID of the GPU (given at the start of your shell prompt in a terminal), which you can match to the corresponding GPU model on [Hydra's webpage](https://cs.brown.edu/about/system/services/hpc/resources/).
+## Part 2.1: Analyzing Transformer Computations
 
-    We recommend using [this site](https://www.techpowerup.com/gpu-specs/) for researching the specifications of GPUs. *(Hint: The bandwidth of host-to-device and device-to-host transfers is determined by its bus interface. PCIe 3.0 has a bandwidth of 1GB/s per lane, while PCIe 4.0 has a bandwidth of 2GB/s per lane. For a PCIe specification, the number after the x refers to the number of lanes.)*
+### Part 2.1.1: Matrix multiplication
 
-    The bandwidth of host-to-device and device-to-host transfers is determined by its bus interface as mentioned. I am working on NVIDIA GeForce GTX 1080 where it uses PCIe 3.0x16 that has a a bandwidth of 1GB/s per lane, with 16 lanes. That gives us the transfer rates between device and host (in the ideal sense) of 16GB/s in total. As for device-to-device transfer rates, this is determined by its memory bandwidth internally which is 320GB/s. 
+1. Derive an expression for the number of floating point operations required to perform the operation $C = AB$. Your answer should be in terms of $M$, $K$, and/or $N$.
 
-4. Determine an expression for the number of bytes that the SAXPY kernel reads from/stores to memory, in terms of $N$, the number of elements in each input vector. Assume the kernel uses single precision (FP32), i.e. uses elements with a size of 4 bytes. Only consider the input and output vectors; you can ignore the loading of the constant parameters $n$ and $\alpha$ in your solution.
+   Lets assume A is a matrix of teh shape shape $M \times K$, B is a matrix of the shape $K \times N$. Therefore, we want C to be a matrix of the shape $M \times N$.
 
-    The number of bytes to read or write a singular input vector of size $N$ where each element is represented by FP32, where each element is $4$ bytes is represented as
-    $$ \texttt{inputBytesRead}= 4N$$
-    Now, we have to read two input vectors of size $N$ and write on output vector of size $N$ as well. Therefore, the total number of bytes is
-    $$ \texttt{totalBytesReadAndWrite}= 12N $$ 
+   For each element in $C$, $C[i,j]$, we need to compute $$A[i,k] \times B[k,j] \quad \quad i \in M \mid \mid j \in N$$Therefore, for each element we need to compute $K$ multiplication operations and $K-1$ additions to sum up the products. A total of $2K-1$ operation will be needed for each element in $C$.
 
-5. Determine an expression for the number of bytes is moved from/to host memory with each `cudaMemcpy`, in terms of $N$, the number of elements in each input vector. Assume the kernel uses single precision (FP32), i.e. uses elements with a size of 4 bytes.
+   Now, we have a total of $M \times N$ operations in terms of just $M$, $K$, and $N$ is $$2MNK$$
 
-   Since each operation is reading or writing a vector of size $N$ where each element is $4$ btes, each `cudeMemcpy` is responsible for $4N$ bytes.
+2. Derive an expression for the total number of bytes read/written to memory in order to perform the operation $C = AB$. Assume, as well as for the rest of the assignment, that the operation can be done by reading each input matrix once and writing down the output matrix once. Your answer should be in terms of $M$, $K$, $N$, and/or $n$.
 
-6. Research the theoretical compute bandwidth for the GPU you are running on. Running the SAXPY kernel (e.g. `./saxpy -n 1024`) will display the name of your GPU model. Assume the kernel uses single precision (FP32), i.e. uses elements with a size of 4 bytes. We recommend using [this site](https://www.techpowerup.com/gpu-specs/) for researching the specifications of GPUs. 
+   In order to compute $C = AB$ we need to read matrix $A$, read matrix $B$ and write matrix $C$. Since $A$ is a matrix of the shape $M \times K$ and $B$ is of the shape $K \times N$. We represent the number of bytes for each element as $n$. Therefore the read costs can be expressed as $$A = n(M \times K)$$ $$B = n(K \times N)$$ Now the result of this multiplication needs to be written to matrix $C$ of the shape $M \times N$ so this cost is expressed as
+   $$C = n(M \times N)$$
+   so the total memory read and writes is expressed as
+   $$\textrm{Total} = n (MK + KN + MN)
 
-    The NVIDIA GeForce GTX 1080 has a compute bandwidth of 8.873 TFLOPS or $8.873 \times 10^{12} $ FLOPS.
+### Part 2.1.2: Input Projections
 
-7. Determine an expression for the number of FLOPs that the SAXPY kernel performs, in terms of $N$, the number of elements in each input vector.
+1. Derive an expression for the number of floating point operations required to perform the input projections and generate $Q$, $K$, and $V$. Your answer should be in terms of $B$, $N$, and/or $D$.
 
-    For every element $N$, in SAXPY we are computing $ z = \alpha \cdot x + y$. Therefore, each element is multiplied by $ \alpha$ and then needs to be added. Therefore, we get two operations per elements. This gets us a total of 
-    $$ \texttt{totalFLOPS} = 2N $$
+   We have an input matrix, $X$, of the shape $(B, N, D)$ where $B$ is batch size, $N$ is sequence length, and $D$ is the model embedding dimension. In order to calculate $Q$, $K$, and $V$, we need
+   $$Q = X \times W_Q \quad \mid \quad K = X \times W_K \quad \mid \quad V = X \times W_V$$
+   Now, each of these intermediary weight matrices are of the shape $(D \times D)$. Therefore, we can express the calculations for each $K, Q$ and $V$ using the above formula
+   $$\textrm{Key || Queries || Value} = 2BND^2$$
+   since we are multiplying a $(B, N, D)$ matrix with a $(D, D)$ matrix. Since we have $3$ matrices, $K, Q$ and $V$, we express the total as
+   $$\textrm{Total FLOPs for Q,K,V}= 6BND^2$$
 
-8. Determine the theoretical arithmetic intensity of the GPU model you're running on, in FLOPs/byte. Based on the displayed effective arithmetic intensity from the previous task, is your kernel compute or memory bound for $N = 10,000,000$? Why does this make sense, intuitively?
+2. Derive an expression for the total number of bytes read/written to memory in order to perform the input projections. You should assume that any inputs for an operation are read newly _each time_ that operation is performed. Your answer should be in terms of $B$, $N$, $D$, and/or $n$.
 
-    The arithmetic internsity is calculated as 
-    $$ \text{arithInten} = \frac{\texttt{\# of operations}}{\texttt{\# of bytes}}$$
-    Therefore, the theoretical arithemtic intensity can be calculated as
-    $$ \text{arithInten}_{\texttt{theoretical}}= \frac{8.873 \times 10^{12}}{320 \times 10^9} = 27.7 \texttt{ FLOPs/byte}$$
-    The effective arithmetic indensity reported is $0.167 \texttt{ FLOPS/byte}$ which shows this is way below the GPU's theoretical arithmetic intensity. 
-    This makes sense here because we are only performing two operations per element, but each element requires three memory accesses (read both inputs and write one output). Therefore, it makes sense that SAXPY is memory-intensive.
+   In order to perform the input projections for $K, Q$ and $V$ where we need to read the input everytime, we need to
 
-## Part 1: SGEMM
+   - Read the input $(B,N,D)$ on every iteration
+   - Read the weight matrix $(D,D)$ either $W_K, W_Q$ or $W_V$
+   - Write the output matrix $(B,N,D)$ either $K, Q$ or $V$
 
-1. We'll first conceptually walk through how to work with row-major order matrices. For all of the below questions, assume that you are working with a $M \times N$ matrix, i.e. one with $M$ rows and $N$ columns.
+   For each matrix, $K, Q$ or $V$, we need
+   $$\textrm{Bytes per K,Q,V} =n(2BND+D^2)$$
 
-    1. Determine an expression that gives the index $i$ in the 1D array representation of a matrix for an entry located at row $r$ and column $c$. (Note that $r$, $c$, and $i$ are all zero-indexed.)
+   again, where $n$ is the number of bytes per element. Now, again we have to do this for each $K, Q$ and $V$ so we get
+   $$\textrm{Total Bytes for K,Q,V} =n(6BND+3D^2)$$
 
-       In order to calculate the index into the 1D representation of a 2D matrix using row-major ordering, we can calculate this as 
-       $$ i = N \times r + c
+### Part 2.1.3: Scaled Dot-Product Attention
 
-    2. Determine expressions that give (1) the row $r$ and (2) the column $c$ of an entry in the matrix located at index $i$ in its 1D array representation. (Note that $r$, $c$, and $i$ are all zero-indexed.)
+1. **Computing dot-product scores via $QK^T$**
 
-        In order to find the row index given the index into the 1D row-major vector, we must integer floor-divide the given index, $i$, by the number of columns as this tells us how many complete rows of $N$ fit. This is expressed as 
-        $$ r = i // N$$
-        In order to find the column, we can do the modulo of the the index by the number of columns, as this will tell us what is left over (which is the column index)
-        $$ c = i \mod N$$
+   For this question, you may assume that $\sqrt{d_k}$ is provided and you do not need to read it from memory or compute it. You also do not need to consider the transpose operation in your answer (you can think of it as a (negligible) change to the underlying metadata about $K$).
 
-2. For the following questions, assume that we are performing SGEMM for a $M \times K$ matrix $A$, a $K \times N$ matrix $B$, and a $M \times N$ matrix $C$, just as described above.
+   1. Derive an expression for the number of floating point operations required to perform the operation of $\frac{QK^T}{\sqrt{d_k}}$. Your answer should be in terms of $B$, $N$, and/or $D$.
 
-    1. Determine an expression for the number of bytes that the SGEMM algorithm reads from/stores to memory, in terms of $M$, $K$, and $N$. Assume that (1) matrix multiplication can be done by reading each input matrix once and writing down the output matrix once, (2) that the operation is fused (no intermediate computation is stored and then reread), and (3) that the kernel uses single precision (FP32), i.e. uses elements with a size of 4 bytes.
+      We have the shapes of $Q$ and $K$ as $(N, D)$ for $B$ batches which means that the operation $QK^T$ can be expressed as a batched multiplication of a $N \times D$ matrix by a $D \times N$ matrix $B$ times. Using the formula from above, we get
 
-        In order to compute SGEMM, which is computed $$ C = \alpha (A \times B) + \beta C $$ 
-        Therefore, we need to read out inputs are $A, B,$ and $C$. We can calculate this as
-        $$ \texttt{bytesRead} = 4MK + 4KN + 4MN $$
-        Then, we need to write out a matrix, $C$ which can be calulated as 
-        $$ \texttt{bytesWritten} = 4MN $$
-        Therefore, we can calculate the total number of bytes in order to compute SGEMM is 
-        $$ \texttt{bytesTotal} = 4MK + 4KN + 8MN $$
-        
+      $$\textrm{O}=2BN^2D$$
 
-    2. Determine an expression for the number of FLOPs that the SGEMM kernel performs, in terms of $M$, $K$, and $N$.
+      Now we have to divide each element in the output matrix $O$, which has the shape $(B,N,N)$, by $\sqrt{d_k}$. This results in
+      $$\textrm{Normalized O} = BN^2$$
 
-        The total number of floating point operations required to compute SGEMM is is the number of operations in  $$ C = \alpha (A \times B) + \beta C $$ 
-        We first need to compute $ A \times B$ which from looking at the code (or our previous assigment), we need to do $K$ multiplications and $K$ ($K-1$ from prev. assignment) additions. This gets us a total of $MN(2K)$ FLOPs for matrix multiplication. Then, we need to multiply all elements of $AB$ and $C$ by the scalars $\alpha$ and $\beta$ respectively. This requires $MN$ operations each. We then need to add these results together which is another $MN$ FLOPs. The total number of FLOPs can therefore be expressed
-        $$ \texttt{totalFLOPs} = MN(2K) + 3MN = MN(2K+3)
+      operations. Therefore, the total number of FLOPs to perform $\frac{QK^T}{\sqrt{d_k}}$ can be expressed as
+      $$\textrm{Total FLOPs} = 2BN^2D + BN^2$$
 
-3. Based on the displayed effective arithmetic intensity from the previous task and the theoretical arithmetic intensity of the GPU model you're running on (that you determined in the warm-up), is the SGEMM algorithm compute or memory bound when $M = N = K = 1024$? Why does this make sense, intuitively?
+      where the dominating term is just
 
-        Ended up having to restart my SSH, so my GPU changed to a NVIDIA GeForce RTX 2080 Ti. The device-to-device memory bandwidth is 616.0 GB/s and host-device bandwidth is 16GB/s as well (since PCIe 3.0 x16). The compute bandwidth is 13.45 TFLOPS ($13.45 \times 10^{12} $ FLOPS). Therefore, we calculate the theoretical arithmetic intensity as
-        $$ \texttt{arithInten}_{\texttt{2080}} = \frac{13.45 \times 10^{12} \texttt{ operations}}{616 \times 10^9 \texttt{ bytes}}=21.834$$
+      $$\textrm{Total FLOPs} = 2BN^2D $$
 
-        When look at the effective arithmetic intensity, we can see it is $128.188$ FLOPs/byte which results means our implementation is compute-bound. This is obvious because we doing $1024^2(2051)$ operations for only $4(1024^2 + 1024^2 + 2048^2)$ bytes of memory read. 
+   2. How many bytes are read from/written to memory for the operation? (You may assume that $\frac{QK^T}{\sqrt{d_k}}$ is a fused operation: both the $QK^T$ matrix multiplication and the division by $\sqrt{d_k}$ happen before any result is written to memory.) Your answer should be in terms of $B$, $N$, $D$, and/or $n$.
 
-4. Given that each thread block computes a 32×32 block of the output $M \times N$ matrix $C$, derive the formulas for:
+      In order to compute ${QK^T}{\sqrt{d_k}}$, we have to read $Q$ and $K$ and write back the result ($d_k$ is provided). We know that $Q$ and $K$ have the shapes $(B, N, D)$ and each element is $n$ bytes so for each matrix
+      $$\text{Bytes Read per Matrix} = n(BND)$$
 
-    1. The number of thread blocks $B_x$ required along the `x`-dimension, corresponding to the rows of the output matrix. Your answer should be in terms of $M$ and/or $N$.
+      we do this two times for the key and query, so we get a total of
+      $$\text{Total Bytes Read} = n(2BND)$$
 
-         We need to groups the rows of the matrix, $M$, into blocks of 32 threads each. From above, we calulated the number of blocks we need is calculated as  the cieling division expressed as 
-        $$ B = \frac{N+T-1}{T} $$
+      Now, we have to write out a matrix of the shape $(B,N,N)$ so the total write cost is
 
-        Therefore, in order to calcuate $B_x$, it will be 
-        $$ B_x = \frac{M+31}{32} $$
+      $$\text{Total Bytes Written} = n(BN^2)$$
 
-    2. The number of thread blocks $B_y$ required in the `y`-dimension, corresponding to the columns of the output matrix. Your answer should be in terms of $M$ and/or $N$.
+      So the total bytes read from/written to memory for the operation is
 
-        From the same logic as above, in order to calcuate $B_y$, it will be 
-        $$ B_y = \frac{N+31}{32} $$
+      $$\text{Total Bytes} = n(2BND + BN^2)$$
 
-5. Recall that the kernel will perform SGEMM for a single entry of the output matrix. Determine expressions that give:
+2. **Causal masking**
 
-    1. a unique row `r` of the output matrix, in terms of `gridDim.x`, `blockIdx.x`, `blockDim.x`, and/or `threadIdx.x`.
+   Masking is used to enforce a causal relationship where the output at each step does not depend on future steps, thereby preserving the temporal order of the input data. Masking can be implemented in multiple ways. For this problem, you can assume that masking is performed by an elementwise check (as a single FLOP) if an entry should be masked (based on its position in $QK^T$), then reading from memory either the masking value ($-\infty$) or the entry in $QK^T$ at that location, and then storing this value in the transformed $QK^T$.
 
-        Similar to the calculations above, in order to calculate the row of the output matrix, we write this as 
-        $$ \texttt{r = blockIdx.x * blockDim.x + threadIdx.x}
+   1. What is the number of floating point operations required for the masking operation? Your answer should be in terms of $B$, $N$, and/or $D$.
 
-    2. a unique column `c` in terms of in terms of `gridDim.y`, `blockIdx.y`, `blockDim.y`, and/or `threadIdx.y`.
+      Each element in the output matrix of the operation $QK^T$, $O$, needs to be checked if it needs to be masked. Since $O$ has the shape $(B,N,N)$ and each elementwise check is a single FLOP, this is simply expressed as
+      $$\textrm{FLOPs for Masking} = BN^2$$
 
-        Similar logic to above, 
-        $$ \texttt{c = blockIdx.y * blockDim.y + threadIdx.y} $$
+   2. How many bytes are read from/written to memory for the masking operation? Your answer should be in terms of $B$, $N$, $D$, and/or $n$.
 
-6. Let's explore how our memory access pattern changes with this optimization.
+      In order to perform masking, we first need to read $O$ and then write back $O'$ which applies the masking. The shapes of $O$ and $O'$ are $(B, N, N)$ and each element is $n$ bytes. Therefore we can express the total bytes read/written to/from memory as
+      $$\text{Bytes for Masking} = n(2BN^2)$$
 
-    1. In *our previous kernel*, how many times is an entry of $A$ loaded from *global memory*? an entry of $B$? Your answer should be in terms of $M$, $K$, and/or $N$.
+3. **Softmax**
 
-        In our previous kernel for the global memory coalesced kernel, we need to load each entire of $A$, $N$ times and and $B$, $M$ times. This is because there are $M \times N$ threads that loop over the $K$ dimension, loading one entry from $A$ and one from $B$. Each element from $A$ needs to be loaded in from the global memory once for every column, so $N$ times. And similarly with $B$, we load each element one for every row, so $M$ times. 
+   The softmax function is used in machine learning, particularly in the field of deep learning, to convert a vector of real numbers into a probability distribution. Each output of the softmax function is between 0 and 1, and the sum of the outputs is equal to 1. The softmax function $S$ for a vector $z$ of length $K$ is defined as follows:
+   $$S(z)_i = \frac{e^{z_i}}{\sum_{j=1}^K e^{z_j}}$$
+   Denote the output of the masking stage as $A = \frac{QK^T}{\sqrt{d_k}}$
 
-    2. In *this described kernel*, how many times is an entry of $A$ loaded from *global memory*? an entry of $B$? Your answer should be in terms of $M$, $K$, and/or $N$.
+   1. What is the number of floating point operations required for the softmax operation, i.e. $\text{softmax}(A)$? You should assume that the summation in the denominator is calculated _once_ per the dimension softmax operates over. Your answer should be in terms of $B$, $N$, and/or $D$.
 
-        Now, in the shared memory kernel, each thread block shared a tiled chunk of A and B and then performs the calculations on the loaded chunk to accumulate the value, and the moves on to the next chunk. Therefore, each element from $A$ is loaded in $\frac{N}{32}$ and each element from $B$ is loaded in $\frac{M}{32}$ times.
+      In order to perform the softmax operation, $\text{softmax}(A)$, we need to exponentiate each term in $A$, but divide each element by the sum of its row. We know $A$ is an $(N,N)$ matrix. Therefore we have $N$ rows that are each $N$ long. For each row, each element needs to exponentiated,they need to be summed, and then divided by the sum. Exponentiation, summation, and division are all each 1 FLOP. For $N$ elements in a row, each element requires 3 FLOPs for a total of $3N$ FLOPs per row. Since there are $N$ rows, and $B$ batches, the total floating point operations required for the softmax operation are
+      $$\text{FLOPs for Softmax} = 3BN^2$$
 
-    3. In *this described kernel*, how many times is an entry of $A$ loaded from *shared memory*? an entry of $B$? Your answer should be in terms of $M$, $K$, and/or $N$.
+   2. How many bytes are read from/written to memory to perform the softmax operation, i.e. $\text{softmax}(A)$? Your answer should be in terms of $B$, $N$, $D$, and/or $n$.
 
-        Just like the global memory coalesced version, we still need multiply each element in $A$ by an element in $B$, $\mathbf{N}$ times and $B$ by $A$, $\mathbf{M}$ times.
+      In order to perform the softmax operation, we need to read the attention matrix, $A$, which has the shape $(B,N, N)$. Once the softmax operation is applied, the dimensions of the matrix remain unchanged so a $(B,N,N)$ matrix needs to be written out. Again, from above, each element is represented by $n$ bytes so we can express the total bytes read from/written to memory for the softmax operation as
+      $$ \text{Bytes for Softmax} = n(2BN^2)$$
 
-    4. Considering just your answers to the above questions, how much lower does the latency for a memory load from shared memory ($t_s$) have to be, compared to the latency for a memory load from global memory ($t_g$), for the runtime of our kernel to decrease compared to the previous one? (Assume no other overhead is contributing to runtime.) Your answer will be a fraction representing $t_g/t_s$.
+4. **Computing the output**
 
-        If we are always loading from global memory, then we need to do one global load for every multiply–add and we have both $A$ and $B$ so it comes out do $2MNK$ operations, where the total latency becomes $2MNK(t_g)$. 
+   Now denote the output of the softmax stage as $A = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)$. The final stage of scaled dot-product attention can be written as:
+   $$\text{Attention}(Q, K, V) = AV$$
 
-        Now, if we use the shared memory, we can decrease the reads from global memory by a factor of $\texttt{BLOCK\_DIM}$. Therefore, the total latency time to load from global memory for the shared memory is $\frac{2MNK(t_g)}{B}$. We then need to read each element again from the shared memory to compute the actual product, and again we have $A$ and $B$ so we get a total latency of $2MNK(t_s)$. This gets us a total latency of $\frac{2MNK(t_g)}{\texttt{BLOCK\_DIM}}+2MNK(t_s)$ for the shared memory. 
+   1. What is the number of floating point operations required for this step? Your answer should be in terms of $B$, $N$, and/or $D$.
 
-        Now, we want $$\frac{2MNK(t_g)}{B}+2MNK(t_s) < 2MNK(t_g)$$ We can then divide both sides by $2MNK$ and rearrange to get 
-        $$t_s \;<\; t_g \;\Bigl(1 - \tfrac1B\Bigr)$$
-        $$\frac{t_g}{t_s} \;>\; \frac{1}{1 - \tfrac1B}\;=\;\frac{B}{B-1}$$
-        Apply this to where $\texttt{BLOCK\_DIM} = B = 32 $, we find 
-        $$\frac{32}{31} \approx 1.0322580645 $$  
-        as long as a shared‑memory load is even ~3 % faster than a global‑memory load, the tiled kernel will beat the basic one.
-        
-7. Suppose we had a kernel that performs matrix addition, with the same distribution of threads and thread blocks - each thread performs the operation for one entry of the output matrix, and each thread block computes over a 32x32 block of the output matrix. Would such an optimization (loading chunks of the input matrices that a thread block operates over into shared memory, to then be computed over) provide any performance boost? Why or why not?
+      From above, we know that $A$ is the attention matrix in the shape $(B,N,N)$ and $V$ is a matrix of the shape $(B,N,D)$. From the formulas from above, when muliplying two matrices, we find that the total number of floating point operations for the final stage of scaled dot-product attention can be expressed as
 
-    <!-- Your answer here --->
+      $$\text{Total FLOPs for AV}=2BN^2D$$
 
-8. Let's determine the occupancy of our previous kernel. To start with, we need to determine the resource requirements of our kernel:
-    1. The number of threads per thread block
-    2. The amount of shared memory each thread block allocates
-    3. The number of registers each thread requires
+   2. How many bytes are read from/written to memory for this step? Your answer should be in terms of $B$, $N$, $D$, and/or $n$.
 
-    The first we already know is 1024 threads per thread block, as defined by our launch parameters. Your job is to determine the latter two requirements for your `sgemm_shared_mem_cache` kernel. 
+      In order to calculate $AV$, we first need to read the attention matrix of the shape $(B,N,N)$ and the value matrix of the shape $(B,N,D)$. The result will therefore be matrix of the shape $(B,N,D)$. Again, each element is represented by $n$ bytes so we can express the total bytes are read from/written to memory for the final stage of scaled dot-product attention as
+      $$\text{Bytes for AV} = n(BN^2+2BND)$$
 
-    To do so, uncomment the line `CCFLAGS += --ptxas-options=-v` in your `Makefile`, and recompile your `sgemm` executable by running `make clean all`. The PTX assembler will then output metadata about your compiled kernels, in particular the number of registers and amount of shared memory that each uses. (Consider what shared memory allocations the kernel makes - make sure the outputted number aligns with your expectation!)
+5. **Putting everything together**
 
-    From looking at the output of the run with the CCFLAGS enabled, we get `Used 26 registers, 8192 bytes smem, 368 bytes cmem[0]`, which means that our final  list is
-    1. The number of threads per thread block - `1024 threads/block`
-    2. The amount of shared memory each thread block allocates - `8192 bytes/block`
-    3. The number of registers each thread requires - `26 registers/thread`
+   Now that we have computed the number of floating point operations and memory accessions required for each sub-operation in scaled dot-product attention, we can compute the following:
 
-    This does match up with the expectations since the shared memory for each block is a $32 \times 32$ which are each $4$ bytes so we get $2\bigg((32 \times 32) \cdot 4\bigg)=8192$ bytes.
+   1. What is the total number of floating point operations required for scaled-dot product attention? Your answer should be in terms of $B$, $N$, and/or $D$.
 
-9. Using the three resource requirements you determined in the previous question, determine the maximum number of thread blocks that a single SM of the GPU you're running on can support, based on each constraint individually. That is:
-    - Calculate how many thread blocks a single SM could support if only the thread count were limiting (ignoring shared memory and registers).
-    - Calculate how many thread blocks a single SM could support if only shared memory were limiting (ignoring thread count and registers).
-    - Calculate how many thread blocks a single SM could support if only register usage were limiting (ignoring thread count and shared memory).
+      The total number of operation required to perform scaled-dot product attention is the sum of each sub-operation:
 
-    To help you, we've provided a script that provides all the hardware statistics of the GPU you're running on. To get them, run `python3 query_config.py`. Use these statistics along with your kernel's resource requirements to calculate how many thread blocks a single SM can support under each individual constraint. Be sure to show your work!
+      - Dot-product: $2BN^2D + BN^2 $
+      - Masking: $BN^2$
+      - Softmax: $3BN^2$
+      - Attention-Value: $2BN^2D$
 
-    So the results were 
+      The total is the sum of these operations so
+      $$\text{FLOPs for SDPA} = 2BN^2D + BN^2+BN^2+3BN^2+2BN^2D$$
+      $$\text{FLOPs for SDPA} = 4BN^2D +5BN^2$$
 
-    1. If only the thread count were the limiting factor for each SM, then since the number of threads per multiprocessor is $2048$, then we could:
-    $$\frac{2048 \texttt{ threads/SM}}{1048 \texttt{ threads/block}}=2 \texttt{ blocks/SM}$$
-    
-    2. If only shared memory were limiting and each multiprocessor has $98304$ bytes of shared memory:
-    $$\frac{98304 \texttt{ bytes/SM}}{8192 \texttt{ bytes/block}}=12 \texttt{ blocks/SM}$$
+   2. What is the total amount of memory reads/writes in bytes? Your answer should be in terms of $B$, $N$, $D$, and/or $n$.
 
-    3. If only register usage were limiting and each SM has $65536$ registers, first we need to calculate the total number of registers in each SM by multiplying the number of registers per thread by the number of registers, so we get:
-    $$26 \texttt{ registers/thread} \cdot 1024 \texttt{ threads} = 26624 \texttt{ threads}$$
-    $$\frac{65536 \texttt{ registers/SM}}{26624 \texttt{ registers/block}}\approx 2 \texttt{ block/SM}$$
-    
+      Similar to above, the total amount of memory reads/writes in bytes required to perform scaled-dot product attention is the sum of each sub-operation expressed as
 
+      - Dot-product: $n(2BND + BN^2) $
+      - Masking: $n(2BN^2)$
+      - Softmax: $n(2BN^2)$
+      - Attention-Value: $n(BN^2+2BND)$
 
-10. In the previous question, you calculated the maximum number of thread blocks a single SM could support under each resource constraint (thread count, shared memory, and register usage). We calculated this constraint using the unit of thread blocks as work is scheduled on an SM at the granularity of thread blocks, not warps.
+      The total is the sum of these operations so
+      $$\text{Bytes for SDPA} = n(2BND + BN^2+2BN^2+2BN^2+BN^2+2BND)$$
+      $$\text{Bytes for SDPA} = n(4BND +6BN^2)$$
 
-    Now, you'll use your calculations to determine how many warps can be active on each SM. First, identify the limiting resource - that which determines the minimum number of thread blocks the SM can support. Then, using this number, calculate the total number of warps that can be scheduled at the same time on an SM, based on the limiting resource.
+### Part 2.1.4: Multi-Head Attention (MHA)
 
-    Using the statistics outputted by `query_config.py`, then determine the maximum possible number of warps that a single SM could support. Then, use these two values to determine the occupancy of your kernel! 
+1. Derive an expression for the number of floating point operations required for MHA (do not include the input projections in your calculation). Your answer should be in terms of $B$, $N$, $D$, and/or $H$.
 
-    Your answer should provide (1) the number of warps that can be active on each SM at once, (2) which of the 3 resource constraints this was limited by, and (3) your calculated occupancy. Again, be sure to show your work for each of these answers!
+   From above, we know that that the total FLOPs for SDPA for a single attention head can be expressed as
+   $$\text{FLOPs for SDPA} = 4BN^2D +5BN^2$$
 
-    1. The number of warps that can be active on an each block is calculated as:
-    - We have $32$ threads per warp and $1024$ threads per block
-        - This means we have $\frac{1024}{32}=32$ warps/block
-    2. Our most restrictive constraints are both the thread count and register count. Both of these limit us to just 2 blocks/SM. Therefore, we get a total of 
-    $$ 32 \texttt{ warps/block} \cdot 2 \texttt{ blocks} = 64 \texttt{ warps} $$
-    3. Each SM can have up to $64$ warps so our occupancy is
-    $$ \frac{64 \texttt{ warps/SM}}{64 \texttt{ warps/SM}}=100\% \texttt{ occupancy} $$
+   Now in MHA, we have $H$ attention heads, each head of attention only operates on a subsect of the embedding. This is calculated as $d_{\text{model}}=\frac{D}{H}$ Now, each attention head gets a smaller dimension, but we are doing it $H$ times so we can express this as
 
-11. Suppose that we have a kernel where each thread computes one entry in $C$. How many entries of $A$, $B$, and $C$ does that thread have to load from (shared) memory? How many entries are loaded per computed result? Your answers should both be in terms of $M$, $K$, and/or $N$.
+   $$\text{FLOPs for MHA} = H \times \bigg(4BN^2\bigg(\frac{D}{H}\bigg) +5BN^2\bigg)$$
+   $$\text{FLOPs for MHA} = 4BN^2D +5HBN^2$$
 
-    Suppose that we instead have a kernel where each thread computes $TM$ consecutive entries in the same column of $C$. How many entries of $A$, $B$, and $C$ does that thread have to load from (shared) memory? How many entries are loaded per computed result? Your answers should both be in terms of $M$, $K$, $N$, and/or $TM$.
+2. Derive an expression for the total number of bytes read/written to memory in order to perform MHA (do not include the input projections in your calculation). Your answer should be in terms of $B$, $N$, $D$, $H$, and/or $n$.
 
-    How does the number of entries loaded made per computed result change between the two scenarios? How does arithmetic intensity change?  
+   Similar to the above seps, we know the total number of bytes read/written to/from memory for SPDA. This is expressed as
+   $$\text{Bytes for SDPA} = n(4BND +6BN^2)$$
 
-    For the first kernel where each thread computes one entry in $C$, then for each entry it has to load the entire row from $A$ so $K$ entries. It also has to read the entire column from $B$ so $K$ entries as well. Finally, we read one entry from $C$, so the total entries loaded from shared memory and loaded per computed result is $2K+1$.
+   Now, for multi-headed attention, there are $H$ heads of attention, and each head is only operating on a $\frac{D}{H}$ subsect of the input embedding. Therefore, we can express the total bytes for MHA as
 
-    For the secodn kernel where each thread computes $TM$ consecutive entries in the same column of $C$, since each thread is now calculated $TM$ entries, we need to load $TM$ rows now so $TM \times K$ entries from $A$, still one column from $B$ for $K$ entries. Finally, we need to read $TM$ entries from $C$. The total memory loads is now $(TM \times K)+K+TM$. However, the total number of entries loaded per computed result is divided by $TM$ so we get $K + \frac{K}{TM} + 1$.
+   $$\text{Bytes for MHA} = H \times n\bigg(4BN\bigg(\frac{D}{H}\bigg) +6BN^2\bigg)$$
+   $$\text{Bytes for MHA} = n\bigg(4BND+6HBN^2\bigg)$$
 
-    The total number of entires loaded per computed result changed by $K-\frac{K}{TM}$ which approaches $K$ as $TM$ increases. For the first kernel, we can see that the arithmetic intensity is
-    $$ \frac{ 2K+1 \texttt{ ops}}{ 2K+1 \texttt{ mem}} \approx 1 $$
-    whereas for the second kernel, we can see 
-    $$ \frac{ 2TM \cdot K \texttt{ ops}}{ TM \cdot K \texttt{ mem}} \approx 2 $$
-    which shows the arithmetic intensity doubles for the tiling approach meaning we can do twice as many operations per memory load.
+3. How does the number of FLOPs for MHA scale with sequence length? (e.g. linearly, quadratically, cubically?)
 
-12. With this new configuration, how many threads should each thread block contain? Your answer should be in terms of $BM$, $BN$, $BK$, and/or $TM$.
+   Looking at the expression $4BN^2D +5HBN^2$, we can see that the number of FLOPs scales quadratically $O(n^2)$ with sequence length. This is because each token needs to attend to all other tokens, creating a quadratic relationship.
 
-    Each thread is now computing $TM$ entires for a column in the output $C$. Each thread block is now computing a $BM \times BN$ section of $C$. Therefore, each column will $\frac{BM}{TM}$ $ threads to compute the full column of the output section, since each column as $BM$ entries. Then, each block has $BN$ column to compute, so the total number of threads is 
-    $$ \frac{BM}{TM} \times BN $$
+4. How does the total memory access in bytes scale with sequence length? (e.g. linearly, quadratically, cubically?)
 
-13. Suppose that we instead have a kernel where each thread computes a $TM \times TN$ section of $C$. How many total loads from $A$, $B$, and $C$ does that thread have to make from (shared) memory? How many loads are made per computed result? Your answers should both be in terms of $M$, $K$, $N$, $TM$, and/or $TN$.
+   Similar to the number of FLOPs, looking at the expression $n\bigg(4BND+6HBN^2\bigg)$, we can see that the number of bytes scales quadratically $O(n^2)$ with sequence length since $6HBN^2$ is the dominating term.
 
-    Comparing your result to those from CQ 11, how does the number of entries loaded made per computed result change with this scenario? How does arithmetic intensity change?
+5. Given a batch size $B = 16$, model dimension $D = 4096$, sequence length $N = 16384$, number of attention heads $H = 16$, and using half-precision (FP16), i.e. using a datatype with a size of 2 bytes, is MHA compute or memory bound on an A100-80GB SXM? The datasheet for an A100 can be found [here](https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a100/pdf/nvidia-a100-datasheet-us-nvidia-1758950-r4-web.pdf).
 
-    In order to calculate aa $TM \times TN$ section of $C$, we need to load $TM$ rows of $C$, each with $K$ elements. We need to also load $TN$ columns of $B$ with $K$ elements each and a $TM \times TN$ section of $C$. Therefore, the total memory loads is
-    $$ TMK + TNK + \bigg(TM \times TN\bigg)=K\bigg(TM+TN\bigg)+\bigg(TM \times TN\bigg)$$
-    however, since we are computing $TM \times TN$ entries, the memory loads per computed result is
-    $$\frac{K}{TN}+\frac{K}{TM}+1$$
+   The offline compute of the A100-80GB SXM is $312 \times 10^{12}$ FLOPs with a memory bandwidth of $2.039 \times 10^{12}$ bytes/s. In order to find out whether MHA is compute bound or memory-bound for this given example, we have to first calculate the machine's balance and compare it to the arithmetic intensity of MHA in this scenario. The ridge-point on the roofline model for MHA on an A100-80GB SXM determines when it transitions from memory-bound to compute-bound. The machine balance is calculated as
 
-    The difference between the number of entries loaded made per computed result of the 1D-tiling and 2D-tiling approach is 
-    $$K + \frac{K}{TM} + 1 - \frac{K}{TN}-\frac{K}{TM}-1 = K- \frac{K}{TN}$$
-    so we can save by another factor of $K$.
+   $$\text{Machine Balance} = \frac{\text{Peak FLOPs}}{\text{Memory Bandwidth}}$$
 
-    The total memory operations for a 
-    $TM \times TN$ section of $C$ is $$K\bigg(TM+TN\bigg)+2\bigg(TM \times TN\bigg)$$ and the total number of arithmetic operations $TM \times TN \times K$ multiplications, $TM \times TN \times K$ additions, $2 \times TM \times TN$ for the scaling so the total is $$\bigg(TM \times TN\bigg)\bigg(2K + 1\bigg)$$
-    therefore we can calculate the arithmetic intensity
-    $$\frac{\bigg(TM \times TN\bigg)\bigg(2K + 1\bigg)}{K\bigg(TM+TN\bigg)+2\bigg(TM \times TN\bigg)}$$
+   Now, we can plug in our offline measurements for the A100-80GB SXM as
 
-    This comes out to around $2$ as well which shows that we have just also doubled the AI.
+   $$\text{MB}_{\text{A100-80GB}}=\frac{312 \times 10^{12} \text{ FLOPs}}{2.039 \times 10^{12} \text{ bytes/s}} = 153.02 \text{ FLOPS/byte}$$
 
+   Now, we have to calculate the arithmetic intensity, which can be expressed as
 
-14. With this new configuration, how many threads should each thread block contain? Your answer should be in terms of $BM$, $BN$, $BK$, $TM$, and/or $TN$.
+   $$\text{Arithmetic Intensity} = \frac{\text{FLOPs}}{\text{Bytes Accessed}}$$
 
-    Following similar logic from the 1D tiling, we know that each thread block is now computing a $BM \times BN$ rectangle of $C$. Each thread in the 1D tiling scenario was responsible for a sliver of a column, but now each thread is also responsble for a sliver of the row as well so each thread is responsible for $\frac{BM}{TM}$ rows, and $\frac{BN}{TN}$ rows which is expressed as
-    $$\bigg(\frac{BM}{TM}, \frac{BN}{TN}\bigg)$$
+   Applying this in the case MHA, we get
 
-## Part 2: 1D Convolution
+   $$\text{Arithmetic Intensity for MHA} = \frac{4BN^2D +5HBN^2}{n\bigg(4BND+6HBN^2\bigg)}$$
 
-1. What is the GPU memory bandwidth for the T4? What is the single precision compute bandwidth for the T4? A datasheet for the NVIDIA T4 GPU can be found [at this link](https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/tesla-t4/t4-tensor-core-datasheet-951643.pdf).
+   plugging in for our known variables, we get
 
-    The GPU memory bandwidth for a T4 is 300 GB/sec and the single precision compute bandwidth 8.1 TFLOPS. 
+   $$\text{AI}_{\text{MHA}} = \frac{4(16)(16384^2)(4096) +5(16)(16)(16384^2)}{2\bigg(4(16)(16384)(4096)+6(16)(16)(16384^2)\bigg)}=84.865$$
 
-2. What is the theoretical arithmetic intensity for the T4, using the information above? Your answer should be given in FLOPs/byte.
+   Since we can see that $$\text{AI}_{\text{MHA}} < \text{MB}_{\text{A100-80GB}}$$ $$84.865<153.02$$
 
-   Given these stats on the T4, we can calculate the theoretical arithmetic intensity as
-   $$\frac{8.1 \times 10^{12} \texttt{ FLOPS}}{320 \times 10^9 \texttt{ bytes}} = 25 FLOPs/byte$$
+   Therefore, since out arithmetic intensity is less than our machine balance, MHA is memory-bound.
 
-3. What is the total number of floating point operations required to compute the convolution?
+### Part 2.1.5: Output Projections
 
-   Since our kernel length is $3$ then for each element we need to do $3$ multiplications and $2$ additions to sum. Then there is one more addition to add the bias term so we get a total of $6$ operations per element. Then for every convolution we have a total of $B \times D \times L$ output elements. Therefore the number of floating point operations required to compute the convolution is 
-   $$1 \times 8192 \times 8192 \times 6=402,653,184$$
-   
-4. What is the total number of bytes accessed (read + written) to compute the convolution? For this question, assume that the input is first read from memory, padded, and the padded input is written back to memory. As our filter has a length of 3, we will have to pad the original input along the $L$ dimension with 4 zeros, 2 on both sides. The padded input, filter, and bias are then read from memory, the convolution is computed, and the output is then written back to memory.
+1. Derive an expression for the number of floating point operations required to perform the output projection $XW$. Your answer should be in terms of $B$, $N$, and/or $D$.
 
-    First we read the original input which is $(1, 8192, 8192)$ and each element is 4 bytes so we read 
-    $$1 \times 8192 \times 8192 \times 4=268,435,456 \texttt{ bytes}$$
-    Then we write the padded output back out where the sequence length now increases by $2$
-    $$1 \times 8192 \times 8194 \times 4=268,500,992 \texttt{ bytes}$$
-    Then we read the padded input, filter, and bias
-    $$1 \times 8192 \times 8194 \times 4=268,500,992 \texttt{ bytes}$$
-    $$8192 \times 3 \times 4=98,304 \texttt{ bytes}$$
-    $$ 8192 \times 4=32,768 \texttt{ bytes}$$
-    Finally we write the output out which is the shape of the original input
-    $$1 \times 8192 \times 8192 \times 4=268,435,456 \texttt{ bytes}$$
-    We can then sum up all of the bytes to get
-    $$\text{Total bytes}\approx1,074,003,968\texttt{ bytes}$$
+   Now, in order to compose the final output of the attention layer, we need to multiply $X$, the concatenated output of the multi-head attention, with the output projection matrix, $W$. The dimensions of $X$ are therefore $(B,N,D)$ and $W$ is $(D,D)$. Following the formula from part 2.1.1, we get
+   $$\text{FLOPS for Output Projection} = 2BND^2$$
 
-5. Using your answers from the previous two questions, what is the arithmetic intensity of the operation?
+2. Derive an expression for the total number of bytes read/written to memory in order to perform the output project $XW$. Your answer should be in terms of $B$, $N$, $D$, and/or $n$.
 
-   We can calculate the arithmetic intensity of the 1D convolution as
-   $$\frac{402,653,184}{1,074,003,968}=0.3749$$
+   Now, in order to calculate $XW$, we need to read $X$ and $W$, and then write the output. Fromt above, the shape of $X$ is $(B,N,D)$ and the shape of $W$ is $(D,D)$. Therefore, the output shape of $XV$ is $(B,N,D)$. Again, each element is represented by $n$ bytes. The total number of bytes read/written to memory in order to perform the output project $XW$ is
+   $$\text{Bytes for Output Projection} = n(2BND+D^2)$$
 
-6. Is this operation compute or memory bound on a T4 GPU? Justify your answer.
+### Part 2.1.6: Feed-Forward Networks (MLPs)
 
-    This operation is clearly memory-bound as it is less than the calculated theoretical AI for the T4 and we can see that we are doing far fewer operations per byte loaded.
+1. Derive an expression for the number of floating point operations for a forward pass of the MLP. Your answer should be in terms of $B$, $N$, and/or $D$.
 
-7. Given your previous responses, why is having two separate kernels (instead of a single one): one for padding and another for computing the convolution a bad idea?
+   In the MLP layer for a forward pass, we compute $\hat{z}=W_1x+b_1$ and $\hat{y}=W_2\hat{z}+b_2$ where $x$ is the output of the multi-head attention block with the shape $(B,N,D)$. The hidden dimension is $4D$ is traditional MLP blocks which means the shape of $W_1$ is $(D, 4D)$ and $W_2$ is $(4D, D)$ The bias vectors are of the shape $(1,D)$ Using the above formula, we can write
 
-    Having two separate kernels where one is responsible for pdding and another the computing, it would mean we would need to separately read and write the input for each kernel which would add to the already memory-bound convolution. Instead, we want to find a way to do more computations on each memory load rather than increasing the number of them.
+   $$
+   \text{FLOPs for }\hat{z}=8BND^2+4BND
+   $$
 
-8. As mentioned in lecture and part 1, there a few simple principles that can help us achieve good performance (fusion, tiling, pipelining, caching/recomputation, etc.). What opportunities exist to apply (1) fusion and (2) tiling to a CUDA kernel that implements 1D depthwise convolution?
+   $$
+   \text{FLOPs for }\hat{y}=8BND^2+BND
+   $$
 
-    The first and most obvious fusion opportunity is to pad the kernel on-the-fly and combine it with the same kernel for the convolution. Then as for tiling, we can load chunks of the input into shared memory and work over those or try to compute multiple outputs per thread like TM outputs per thread.
+   $$
+   \text{Total FLOPs for MLP}=16BND^2+5BND
+   $$
 
-9. We want to expose enough parallel work to the GPU in order to achieve good performance. How will you parallelize the work in the algorithm (i.e. how will you split work along individual threads)?
+2. Derive an expression for the total number of bytes read/written to memory for a single forward pass through the MLP. Assume that the operation is not fused, i.e. the intermediate result between the two projections is stored and then read. Your answer should be in terms of $B$, $N$, $D$, and/or $n$.
 
-   The way that I plan on dividing the work is so that each thread is responsible for one output position in the sequence which will be divided amongst the blocks. Each thread can handle a different position in the sequence, whereas each block is processing a different dimension, and then each batch is processed independently. 
+   In order to calculate the total number of bytes read/written to memory for a single forward pass through the MLP, we need to first read the input matrix $x$ of the shape $(B,N,D)$ and the first weight matrix, $W_1$, of the shape $(D, 4D)$, and the first bias vector of the shape $(1,4D)$. We first compute and write out the intermediary output, $\hat{z}$, of the shape $(B,N,4D)$. Then, we compute and write out the MLP output, $\hat{y}$ of the shape $(B,N,D)$ which requires us to read in the intermediary output, $\hat{z}$, the second weight matrix, $W_2$, of the shape $(4D,D)$, and the secodn bias term $b_2$ of the shape $(1,D)$. Again, each element is represented by $n$ bytes so we have a total of
+
+   $$
+   \text{Total Bytes for MLP} = n(BND+4D^2+4D+4BND+4BND+4D^2+D+BND)
+   $$
+
+   $$
+   \text{Total Bytes for MLP} = n(10BND+8D^2+5D)
+   $$
+
+3. Using the same values from question 5 of the [part 2.1.4](#Part-214-Multi-Head-Attention-MHA), how does the arithmetic intensity of the MLP compare to that of MHA when run on a A100-80GB SXM?
+
+   In order to calculate the arithmetic intensity of the MLP, we can use the formula from abouve
+
+   $$\text{Arithmetic Intensity} = \frac{\text{FLOPs}}{\text{Bytes Accessed}}$$
+
+   Applying this in the case of the MLP, we get
+
+   $$\text{Arithmetic Intensity for MLP} = \frac{16BND^2+5BND}{n(10BND+8D^2+5D)}$$
+
+   plugging in for our known variables, we get
+
+   $$\text{AI}_{\text{MLP}} = \frac{16(16)(16384)(4096^2)+5(16)(16384)(4096)}{2\bigg(10(16)(16384)(4096)+8(4096^2)+5(4096)\bigg)}=3236.586$$
+
+   From above, we know that the machine balance on an A100-80GB SXM is $\text{MB}_{\text{A100-80GB}}=153.02$ and the arithmetic intensity for MHA is $\text{AI}_{\text{MHA}} =84.865$. We can see the arithmetic intensity of the MLP is much higher than MHA, and so much so that $AI_{\text{MLP}} > MB_{\text{{A100-80GB}}}$ meaning that the MLP is actually compute-bound where as MHA is memory-bound.
+
+## Part 2.2: Analyzing Naive GPT-2 XL Inference Computations
+
+GPT-2 XL has the following architectural details:
+
+- `n_vocab` = 50257
+- `n_embed_dim` = 1600
+- `n_heads` = 25
+- `n_layers` = 48
+- `mlp_hidden_dim` = 6400
+
+Some additional notes for this problem:
+
+- We’ll refer to the batch size as B and the sequence length as N , just as before.
+- We’ll ignore the embedding layers, layer normalization layers, skip connections, and language modeling head as they’re all relatively inconsequential compared to the core transformer loop.
+- Assume all computations are done with 16-bit precision (i.e. using a datatype
+  with a size of 2 bytes).
+- We are focused on inference, so we’ll consider just the forward pass, as before
+
+1. How many FLOPs and memory accesses are required to perform attention (performing input projections, then MHA, and then the output projection) on a $B \times N$ batch of tokens? (Use your results from the last part!)
+
+   _Hint: your answer will take the form:_ \
+   FLOPs = $C_1 \times BN + C_2 \times BN^2$ \
+   MEM = $C_3 + C_4 \times BN + C_5 \times BN^2$
+
+   Now, in order to calculate the total FLOPs and memory accesses required to perform attention, we have to sum up all of the component parts we calculated.
+
+   - Input Projections
+     - FLOPs: $6BND^2$
+     - Bytes:$n(6BND+3D^2)$
+   - MHA
+     - FLOPs: $4BN^2D +5HBN^2$
+     - Bytes: $n\left(4BND +6HBN^2\right)$
+   - Output Projection:
+     - FLOPs: $2BND^2$
+     - Bytes: $n(2BND+D^2)$
+
+   We ca sum these up to get
+   $$\text{Total FLOPs for Attention}=6BND^2+4BN^2D +5HBN^2+2BND^2$$
+   $$\text{Total FLOPs for Attention}=8BND^2+4BN^2D +5HBN^2$$
+
+   $$\text{Total Bytes for Attention}=n\left(6BND+3D^2+4BND +6HBN^2+2BND+D^2\right)$$
+   $$\text{Total Bytes for Attention}=n\left(12BND+4D^2 +6HBN^2\right)$$
+
+2. How many FLOPs and memory accesses are is required to run an MLP on a $B \times N$ batch of tokens? (Use your answer from the last part!)
+
+   From above, we found that
+
+   $$
+   \text{Total FLOPs for MLP}=16BND^2+5BND
+   $$
+
+   $$
+   \text{Total Bytes for MLP} = n(10BND+8D^2+5D)
+   $$
+
+3. How many FLOPs and memory accesses are is therefore required to perform an inference using all layers of the full GPT-2 XL model?
+
+   First, to calculate the full attention block + MLP FLOPs and memory access, we must combine the results from part 1 and 2. We find
+   $$\text{Total FLOPs for Attention + MLP}=24BND^2+4BN^2D +5HBN^2+5BND$$
+   $$\text{Total Bytes for Attention + MLP}=n\left(22BND+12D^2 +6HBN^2+5D\right)$$
+
+   Now, in the GPT-2 XL model, there are 48 layers of consisting of an attention and MLP block. Therefore, we can express the total FLOPs for GPT2-XL by performing these operations 48 times as
+
+   $$\text{Total FLOPs for GPT2-XL}=1152BND^2+192BN^2D +240HBN^2+240BND$$
+   $$\text{Total Bytes for GPT2-XL}=n\left(1056BND+576D^2 +288HBN^2+240D\right)$$
+
+4. We’ll assume that we are using an NVIDIA T4 GPU with a theoretical memory bandwidth of 300 GB/s and a theoretical compute bandwidth of 65 TFLOPs/s. Let’s look at a few scenarios to try to understand inference bottlenecks in practice. In each of the following cases: how many FLOPs and memory accesses are required for a forward pass of the full GPT-2 XL model? Is the GPU memory bound or compute bound?
+
+   In order to determine if the GPU is memory of compute bound in each scenario, we need to calculate $T_{\text{compute}}$ and $T_{\text{memory}}$ which are calculated as
+   $$T_{\text{compute}}=\frac{\text{FLOPs}}{\text{Compute Bandwidth}}$$
+   $$T_{\text{memory}}=\frac{\text{Memory Accesses}}{\text{Memory Bandwidth}}$$
+   If $T_{\text{compute}} > T_{\text{memory}}$, then the scenario is compute-bound, otherwise it is memory-bound. On an NVIDIA T4 GPU, the memory bandwidth is $3 \times 10^{11}$ bytes/s and compute bandwidth of $6.5 \times 10^{13}$ FLOPs/s. The GPT2-XL architecture has a model dimension of $D=1600$ and a total of $H=25$ attention heads. GPT2 also uses FP16 for the elements so $n=2$. From above, we know
+   $$\text{Total FLOPs for GPT2-XL}=1152BND^2+192BN^2D +240HBN^2+240BND$$
+   $$\text{Total Bytes for GPT2-XL}=n\left(1056BND+576D^2 +288HBN^2+240D\right)$$
+
+   - B=1 and N=32
+
+     Using the above formulas, we can plug in to find the FLOPs and memory accesses
+     $$\text{FLOPs}_{(1,32)}=9.47 \times 10^{10}$$
+     $$\text{Memory}_{(1,32)}=3.07 \times 10^{9}$$
+
+     Now, we can compute $T_{\text{compute}}$ and $T_{\text{memory}}$.
+     $$T_{\text{compute}}=\frac{9.47 \times 10^{10}}{6.5 \times 10^{13}}=0.00145 \ s$$
+     $$T_{\text{memory}}=\frac{3.07 \times 10^{9}}{3 \times 10^{11}}= 0.01023 \ s$$
+
+     Since $T_{\text{memory}} >T_{\text{compute}}$ we can see the GPU is memory bound in this situation.
+
+   - B=1 and N=1024
+
+     Same steps as above
+     $$\text{FLOPs}_{(1,1024)}=3.35 \times 10^{12}$$
+     $$\text{Memory}_{(1,1024)}=2.15 \times 10^{10}$$
+
+     Now, we can compute $T_{\text{compute}}$ and $T_{\text{memory}}$.
+     $$T_{\text{compute}}=\frac{3.35 \times 10^{12}}{6.5 \times 10^{13}}=0.0515 \ s$$
+     $$T_{\text{memory}}=\frac{2.15 \times 10^{10}}{3 \times 10^{11}}= 0.0716 \ s$$
+
+     Since $T_{\text{memory}} >T_{\text{compute}}$ we can see the GPU is memory bound in this sitatuion.
+
+   - B=64 and N=32
+
+     Same steps as above
+     $$\text{FLOPs}_{(64,32)}=6.06 \times 10^{12}$$
+     $$\text{Memory}_{(64,32)}=1.08 \times 10^{10}$$
+
+     Now, we can compute $T_{\text{compute}}$ and $T_{\text{memory}}$.
+     $$T_{\text{compute}}=\frac{6.06 \times 10^{12}}{6.5 \times 10^{13}}=0.0932 \ s$$
+     $$T_{\text{memory}}=\frac{1.08 \times 10^{10}}{3 \times 10^{11}}= 0.0360 \ s$$
+
+     Since $T_{\text{compute}} >T_{\text{memory}}$, the GPU is actually compute bound in this situation.
+
+   - B=64 and N=1024
+
+     Same steps as above
+     $$\text{FLOPs}_{(64,1024)}=2.14 \times 10^{14}$$
+     $$\text{Memory}_{(64,1024)}=1.19 \times 10^{12}$$
+
+     Now, we can compute $T_{\text{compute}}$ and $T_{\text{memory}}$.
+     $$T_{\text{compute}}=\frac{2.14 \times 10^{14}}{6.5 \times 10^{13}}=3.2923 \ s$$
+     $$T_{\text{memory}}=\frac{1.19 \times 10^{12}}{3 \times 10^{11}}= 3.9667 \ s$$
+
+     Since $T_{\text{memory}} >T_{\text{compute}}$, the GPU is again memory bound in this situation.
+
+## Part 2.3: Analyzing GPT-2 XL Inference with KV Caching!
+
+We’re now going to assume that we’ve already filled our KV cache with $B × (N − 1)$ tokens, and we want to decode B new tokens in parallel using that KV cache (e.g., decode 1 new token each for each item in the batch). Let’s do the same math and see what changes!
+
+1. How big is the KV cache at each layer, in terms of $B$ and $N$? Assume it’s also stored in 16-bit precision.
+
+   The KV cache is storing the progressively built K and V matrices for each batch($B$), layer($L$), token($N$), and head($H$). For each head, its cache occupancy will be $d_{\text{model}}=\frac{D}{H}$ and each element occupies $n$ bytes. Now, we can express this as
+
+   $$
+   \text{Size of KV Cache} = 2n(L \times B \times N \times H \times d_{\text{model}} )
+   $$
+
+   We have the factor $2$ as we store both $K$ and $V$. Now, applying this to the case of GPT2-XL, we have $n=2$, $L=48$, $H=25$, $d_{\text{model}}=64$. Now, plugging these factors in, we get
+
+   $$
+   \text{Size of KV Cache} = 4(48 \times B \times N \times 25 \times 64 ) = 307200BN \text{ bytes}
+   $$
+
+2. How many FLOPs and memory accessions are required to perform attention to decode this batch of $B$ tokens?
+
+   - You should assume that the $KV$ cache is not in memory. Assume that when the keys and values outputted in the input projection step (part 2.1.2) are stored, they are stored in the $KV$ cache (i.e. they are not stored elsewhere for use in later steps). As such, assume that K and V are loaded from the $KV$ cache when they are needed (e.g. for $QK^T$ and matrix multiplication by $V$, respectively).
+
+   _Hint: we only need to perform the attention calculations for this batch of tokens, and there's no masking required! Your answer will take the form:_ \
+   FLOPs = $C_1 \times B + C_2 \times BN$ \
+   MEM = $C_3 + C_4 \times B + C_5 \times BN$
+
+   Similar to above, in order to calculate the total FLOPs and memory accesses required to perform attention, we have to sum up all of the component parts we calculated, but now with the KV cache.
+
+   - Input Projections:
+     Now with KV caching, we only caclulate the projections for the current token in the sequence, so $N=1$
+     - FLOPs: $6BD^2$
+     - Bytes:$n(6BD+3D^2)$
+   - MHA
+     Now, $Q$ has the shape $(B,H,1, \frac{D}{H})$, since and the cached $K$ and $V$ are of the shape $(B,H,N,\frac{D}{H})$. Now, we can recalculate the different parts of MHA across all heads as:
+
+     - **SDPA ($QK^T$)**:
+       - FLOPs: $2BND + BN$ (including the dividing by $d_{\text{model}}$)
+       - Memory Access: $n(BD+BND+BHN)$
+     - **Softmax**:
+       Since Softmax operates on the attention output, we compute it across the $N$ dimension for current attention row
+       - FLOPs: $3BHN$
+       - Memory Access: $n(2BHN)$
+     - **Attention Output**:
+       Now the final step of attention is to multiply the attention output, $A$, which has the shape $(B, H, 1, N)$ and the cached values $V$.
+       - FLOPs: $2BND$
+       - Memory Access: $n(BHN+BND+BD)$
+
+     This makes the total for MHA with KV caching
+     $$\text{FLOPs for MHA with KV}=4BND+3BHN+BN$$
+     $$\text{Bytes for MHA with KV}=n(2BD+2BND+2BHN)$$
+
+   - Output Projection:
+
+     Now the output, $X$, which is of the shape $(B, 1, D)$ by the projection matrix, $P$, which is of the shape $(D,D)$. This means the total FLOPs here are calculated as
+     $$\text{FLOPs for Projection} = 2BD^2$$
+     $$\text{Bytes for Projection} = n(2BD+D^2)$$
+
+   This makes the total FLOPs for an attention block with KV caching expressed as (omitting the extra $BN$ term):
+   $$\text{FLOPs for Attention with KV} = 8BD^2+4BND+3BHN$$
+   $$\text{Bytes for Attention with KV} = n(10BD+4D^2+2BND+2BHN)$$
+
+3. How many FLOPs and memory accessions are required to run an MLP on this batch of $B$ tokens?
+
+   From above, we found that
+
+   $$
+   \text{Total FLOPs for MLP}=16BND^2+5BND
+   $$
+
+   $$
+   \text{Total Bytes for MLP} = n(10BND+8D^2+5D)
+   $$
+
+   However, now we effectively have $N=1$, so we can simplify these to
+
+   $$
+   \text{Total FLOPs for MLP with KV}=16BD^2+5BD
+   $$
+
+   $$
+   \text{Total Bytes for MLP with KV} = n(10BD+8D^2+5D)
+   $$
+
+4. How many FLOPs and memory accessions are required to decode this batch of $B$ tokens through the full GPT-2 XL model?
+
+   As from above, the full decoding pass will be the combination of the MHA without casual masking + the MLP. Therefore, we can express to the total FLOPs and memory accessions for each layer as
+   $$\text{Total FLOPs for KV Attn + MLP}=24BD^2+4BND+3BHN+5BD$$
+   $$\text{Total Bytes for KV Attn + MLP}=n(20BD+12D^2+2BND+2BHN+5D)$$
+
+   Now, we have $48$ layers of Attention + MLP in the GPT2-XL model. Therefore, we can express the total as
+
+   $$\text{Total FLOPs for KV GPT2-XL}=1152BD^2+192BND+144BHN+240BD$$
+   $$\text{Total Bytes for KV GPT2-XL}=n(960BD+576D^2+96BND+96BHN+240D)$$
+
+5. Let’s look at the same cases we examined before. For each of these, how many FLOPs and memory accesses are now required for a forward pass with the KV cache in place? Are we memory or compute bound? And (roughly) how much faster would we expect case each to theoretically run on the T4 GPU, compared to your answers from the previous part?
+
+   In order to determine if the GPU is memory of compute bound in each scenario, we need to calculate $T_{\text{compute}}$ and $T_{\text{memory}}$ which are calculated as
+   $$T_{\text{compute}}=\frac{\text{FLOPs}}{\text{Compute Bandwidth}}$$
+   $$T_{\text{memory}}=\frac{\text{Memory Accesses}}{\text{Memory Bandwidth}}$$
+   If $T_{\text{compute}} > T_{\text{memory}}$, then the scenario is compute-bound, otherwise it is memory-bound. On an NVIDIA T4 GPU, the memory bandwidth is $3 \times 10^{11}$ bytes/s and compute bandwidth of $6.5 \times 10^{13}$ FLOPs/s. The GPT2-XL architecture has a model dimension of $D=1600$ and a total of $H=25$ attention heads. GPT2 also uses FP16 for the elements so $n=2$. From above, we know
+   $$\text{Total FLOPs for KV GPT2-XL}=1152BD^2+192BND+144BHN+240BD$$
+   $$\text{Total Bytes for KV GPT2-XL}=n(960BD+576D^2+96BND+96BHN+240D)$$
+
+   - B=1 and N=32
+
+     Using the above formulas, we can plug in to find the FLOPs and memory accesses
+     $$\text{FLOPs}_{(1,32)}=2.96 \times 10^{9}$$
+     $$\text{Memory}_{(1,32)}=2.96 \times 10^{9}$$
+
+     Now, we can compute $T_{\text{compute}}$ and $T_{\text{memory}}$.
+     $$T_{\text{compute}}=\frac{2.96 \times 10^{9}}{6.5 \times 10^{13}}=0.0000456 \ s$$
+     $$T_{\text{memory}}=\frac{2.96 \times 10^{9}}{3 \times 10^{11}}= 0.00987 \ s$$
+
+     Since $T_{\text{memory}} >T_{\text{compute}}$ we can see the GPU is memory bound in this situation.
+
+   - B=1 and N=1024
+
+     Same steps as above
+     $$\text{FLOPs}_{(1,1024)}=3.27 \times 10^{9}$$
+     $$\text{Memory}_{(1,1024)}=3.27 \times 10^{9}$$
+
+     Now, we can compute $T_{\text{compute}}$ and $T_{\text{memory}}$.
+     $$T_{\text{compute}}=\frac{3.27 \times 10^{9}}{6.5 \times 10^{13}}=0.0000503 \ s$$
+     $$T_{\text{memory}}=\frac{3.27 \times 10^{9}}{3 \times 10^{11}}= 0.0109 \ s$$
+
+     Since $T_{\text{memory}} >T_{\text{compute}}$ we can see the GPU is memory bound in this situation.
+
+   - B=64 and N=32
+
+     Same steps as above
+     $$\text{FLOPs}_{(64,32)}=1.89 \times 10^{11}$$
+     $$\text{Memory}_{(64,32)}=3.79 \times 10^{9}$$
+
+     Now, we can compute $T_{\text{compute}}$ and $T_{\text{memory}}$.
+     $$T_{\text{compute}}=\frac{1.89 \times 10^{11}}{6.5 \times 10^{13}}=0.0029077 \ s$$
+     $$T_{\text{memory}}=\frac{3.79 \times 10^{9}}{3 \times 10^{11}}= 0.012633 \ s$$
+
+     Since $T_{\text{memory}} >T_{\text{compute}}$, the GPU is still memory bound in this situation.
+
+   - B=64 and N=1024
+
+     Same steps as above
+     $$\text{FLOPs}_{(64,1024)}=2.09 \times 10^{11}$$
+     $$\text{Memory}_{(64,1024)}=2.36 \times 10^{10}$$
+
+     Now, we can compute $T_{\text{compute}}$ and $T_{\text{memory}}$.
+     $$T_{\text{compute}}=\frac{2.09 \times 10^{11}}{6.5 \times 10^{13}}=0.0032154 \ s$$
+     $$T_{\text{memory}}=\frac{2.36 \times 10^{10}}{3 \times 10^{11}}= 0.078633 \ s$$
+
+     Since $T_{\text{memory}} >T_{\text{compute}}$, the GPU is still memory bound in this situation.
+
+6. How does the use of a KV cache affect the number of FLOPs and memory accesses, and why? How does it affect the effective arithmetic intensity of the forward pass? Does it make the operation more memory-bound or more compute-bound?
+
+   We can calculate the arithmetic intensity as
+   $$\text{Arithmetic Intensity} = \frac{\text{FLOPs}}{\text{Memory Accession}}$$
+
+   Now, for regular MHA + MLP, we get an arithmetic intensity of
+   $$\text{AI}_{\text{regular}}=\frac{24BND^2+4BN^2D +5HBN^2+5BND}{n\left(22BND+12D^2 +6HBN^2+5D\right)}$$
+
+   We will plug in the the known values for the GPT2-XL architecture for comparison
+
+   $$\text{AI}_{\text{regular}} = \frac{BN\Bigl(61448000 + 6525N\Bigr)}{BN\Bigl(70400 + 300\,N\Bigr) + 61456000}.$$
+
+   and for the MHA + MLP with KV caching, we get
+
+   $$\text{AI}_{\text{KV Caching}}=\frac{24BD^2+4BND+3BHN+5BD}{n(20BD+12D^2+2BND+2BHN+5D)}$$
+
+   We will plug in the the known values for the GPT2-XL architecture for comparison
+   $$\text{AI}_{\text{KV Caching}} = \frac{B\Bigl(61448\,000 + 6475N\Bigr)}{B\Bigl(64000 + 6500N\Bigr) + 61456000}$$
+
+   We can see that the numerator for $\text{AI}_{\text{regular}}$ is dependent upon both $B$ and $N$ which means for $N>1$, the numerator of $\text{AI}_{\text{regular}}$ grows faster than the numerator of $\text{AI}_{\text{KV Caching}}$ which is only dependent on $B$. We then see that as $N$ grows larger, the numerator of $\text{AI}_{\text{regular}}$ grows proportionally, whereas as the denominator grows much slower. On the other hand, the numerator and denominator of $\text{AI}_{\text{KV Caching}}$ both grow large with an increase in $N$. This means
+   $$\text{AI}_{\text{regular}} > \text{AI}_{\text{KV Caching}}$$
+
+   as $B$ and $N$ grow. This means that since KV caching decreases the arithmetic intensity of attention + MLP, this makes it more memory-bound and less compute bound.
+
+## Part 2.4: Motivating Speculative Decoding
+
+1. Let's decompose the time required to do a forward pass with the model into three components:
+
+   - The time required to read model weights from global memory.
+   - The time required to perform all other global memory accesses besides reading model weights (ignore the cost of reading the KV cache).
+   - The time required to perform the all the computations (FLOPs) in the forward pass.
+
+   In our inference setting (decoding with $B = 1$ and a KV cache on a T4 GPU), which of these three components is most significant? Justify your answer (use your results from earlier questions!).
+
+   In order to do a forward pass with the model, we have our three components. As a reminder, the T4 has a theoretical memory bandwidth of 300 GB/s and theoretical compute bandwidth of 65 TFLOPs/s. Breaking these components down:
+
+   1. Reading weights from memory
+
+      Reading $W_k, W_q, W_v$ and the output projection matrix $P$, and the MLP weights. Going over the dimensions of each of these:
+
+      - $W_k, W_q, W_v = (B,D,D)$
+      - $P = (D,D)$
+      - $MLP = (D, 4D) + (1,4D) \rightarrow (4D,D) + (1+D)$
+
+      Therefore, the total weights loaded where $B=1$ is
+      $$\text{Total Weights Loaded}=3D^2+D^2+8D^2+4D+D$$
+      $$\text{Total Weights Loaded}=12D^2+5D$$
+
+      We know $D=1600$ so we get the total number of weights per layer as
+      $$\text{Total Weights Loaded}=12(1600)^2+5(1600)=30728000$$
+
+      Now, we have $48$ layers, and each parameter requires $2$ bytes in order to be read so we get
+      $$\text{Total Size of All Model Weights}=2\times 48(30728000)=2.95 \text{ GB}$$
+
+      The total amount of time it takes to load the model weights is therefore
+      $$\text{Time to load Wights}=\frac{2.95 \text{ GB}}{300 \text{GB/s}}=0.00983296 \text{ s}$$
+
+   2. Time requires to perform all other global memory accesses
+
+      All other memory accesses include reading the input, writing the query projection, writing and reading the attention scores, writing and reading the softmax, writing and reading the attention output, writing and reading the intermediate MLP output, and finally writing out the output of the MLP. Breaking this down, we get
+
+      - Reading the Input:
+        - $X=n(B,1,D)$
+      - Writing and Reading the Query:
+        - $Q=2n(B,1,D)$
+      - Writing and Reading the Attention Scores:
+        - $QK^T=2n(B,H,N)$
+      - Writing and Reading the Softmax:
+        - $\text{Softmax}(QK^T)=2n(B,H,N)$
+      - Writing and Reading the Attention output:
+        - $A=2n(B,1,D)$
+      - Writing and Reading the MLP intermediate output:
+        - $\hat{z}=2n(B,1,4D)$
+      - Writing block output:
+        - $\hat{y}=n(B,1,D)$
+
+      This brings th total memory accesses for all other global memory to
+      $$\text{Total Other Memory}=n(BD+ 2BD+ 2BHN+2BHN+2BD+8BD+BD)$$
+      $$\text{Total Other Memory}=n(14BD+ 4BHN)$$
+
+      Plugging in our known variables of $B=1$, $D=1600$, $n=2$, and $H=25$ with $48$ layers we get
+      $$\text{Total Other Memory}=0.0021504+ 0.0000096N \text{ GB}$$
+
+      Therefore, we can see for any sequence length less than $N< 307067$ results in less memory. Therefore, If we assume the max sequence length in GPT2-XL of $N=4096$, we get
+      $$\text{Total Other Memory}=0.041472 \text{ GB}$$
+
+      The total amount of time it takes for all other global memory accesses is therefore
+      $$\text{Time to load Weights}=\frac{0.041472 \text{ GB}}{300 \text{GB/s}}=0.00013824 \text{ s}$$
+
+   3. The total number of FLOPs required to perform all of the computations in the forward pass for all layers with KV caching we calculated as
+      $$\text{Total FLOPs for KV GPT2-XL}=1152BD^2+192BND+144BHN+240BD$$
+
+      Plugging in our known variables of $B=1$, $D=1600$, and $H=25$ we get
+
+      $$\text{Total FLOPs for KV GPT2-XL}=2.95 \times 10^9 + 310800N$$
+
+      Again, we will assume a sequence length of $N=4096$ and we find in TFLOPs
+
+      $$\text{Total TFLOPs for KV GPT2-XL}=0.004223 \text{ TFLOPs}$$
+
+      Now, in order to compute the to compute the total amount of time, we can divide this by the compute bandwidth
+      $$\text{Time to Compute} = \frac{0.004223}{65}=0.0000645 \text{ s}$$
+
+   Therefore, we can see the limiting factor here is the **time to load the weights** which takes the most amount of time.
+
+2. Given the bottleneck that you identified, how does speculative decoding help improve latency?
+
+   Speculative decoding helps alleviate the primary bottleneck in inference time which is weight loading by reducing the number of times the large model's weights must be loaded from memory. In speculative decoding, a smaller model is used to predict several tokens at once. The main larger model then verifies whether these tokens are correct using a single forward pass (relying on the autoregressive nature of transformers). If the smaller model's predictions are correct, multiple tokens are generated while loading the weights just once. This effectively amoritizes the weight-loading cost by the number of accepted tokens.
+
+   For example, if 4 of the smaller model's tokens are all accepted, the per-token weight loading cost decreases from 0.00983s to approximately 0.00246s,which improves latency and at worst takes the time of the regular model.
